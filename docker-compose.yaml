@@ -1,0 +1,29 @@
+# This compose runs OUR services (agent + copilot). SigNoz itself runs from its
+# own repo (see README "Step 1"). We reach SigNoz over the host network.
+#
+#   docker compose up --build copilot     # SRE copilot on :8099
+#   docker compose run --rm agent demo    # run the demo scenarios
+#
+# host.docker.internal lets the containers reach SigNoz's collector/UI running
+# on the host. On Linux, the extra_hosts mapping below makes it resolve.
+
+services:
+  copilot:
+    build: .
+    ports:
+      - "8099:8099"
+    env_file: .env
+    environment:
+      SIGNOZ_API_URL: "http://host.docker.internal:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  agent:
+    build: .
+    env_file: .env
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint: ["python", "-m", "src.main"]
+    command: ["demo"]

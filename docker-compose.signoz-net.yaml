@@ -1,0 +1,42 @@
+# Run our services ON THE SAME Docker network as SigNoz (cleaner than
+# host.docker.internal — no host ports, service-name DNS).
+#
+# 1) Start SigNoz first (from signoz/deploy/docker: `docker compose up -d`).
+# 2) Find the network SigNoz created:
+#        docker network ls | grep signoz
+#    Common names: "signoz_default" (compose project "signoz") or "clickhouse-setup_default".
+# 3) Export it (or edit the default below) and set the in-network endpoints in .env:
+#        export SIGNOZ_NETWORK=signoz_default
+#        # in .env:
+#        OTEL_EXPORTER_OTLP_ENDPOINT=http://signoz-otel-collector:4318
+#        SIGNOZ_API_URL=http://signoz:8080
+# 4) Run:
+#        docker compose -f docker-compose.signoz-net.yaml up --build copilot
+#        docker compose -f docker-compose.signoz-net.yaml run --rm agent demo
+#
+# Service-name hints (verify with `docker compose ps` in the SigNoz dir; names
+# have shifted across SigNoz versions):
+#   OTLP collector -> "signoz-otel-collector"  (older: "otel-collector")
+#   UI / query API -> "signoz"                 (older: "query-service":8080)
+
+networks:
+  signoz:
+    external: true
+    name: ${SIGNOZ_NETWORK:-signoz_default}
+
+services:
+  copilot:
+    build: .
+    env_file: .env
+    ports:
+      - "8099:8099"          # expose the copilot UI to your host for the demo
+    networks:
+      - signoz
+
+  agent:
+    build: .
+    env_file: .env
+    networks:
+      - signoz
+    entrypoint: ["python", "-m", "src.main"]
+    command: ["demo"]
