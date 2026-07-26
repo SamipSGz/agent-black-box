@@ -1,147 +1,88 @@
----
-title: "Agent Black Box: giving AI agents a flight recorder with SigNoz"
-event: "Agents of SigNoz — WeMakeDevs × SigNoz"
-track: "Track 01 — AI & Agent Observability"
----
+# Agent Black Box: a flight recorder and SRE copilot for AI agents, built on SigNoz
 
-# Agent Black Box: giving AI agents a flight recorder with SigNoz
+An AI agent that fails in production is hard to debug, because the interesting part happened inside a chain of LLM calls and tool calls you never saw. My hackathon project records every one of those steps into SigNoz, then has a second agent read the telemetry back and explain what went wrong. This is what I built, what broke along the way, and what the telemetry looked like.
 
-When a plane crashes, investigators don't guess. They pull the black box —
-the flight recorder that captured every input, every control surface, every
-second leading up to the failure — and they reconstruct exactly what happened.
+## What I built
 
-AI agents have no black box. They chain LLM calls, invoke tools, query vector
-databases, retry on flaky upstreams, and occasionally spiral into loops that
-quietly burn tokens. When one misbehaves in production, the on-call engineer is
-left squinting at raw logs trying to answer a simple question: *what did the
-agent actually do, and why did it go wrong?*
+Agent Black Box has two halves. The first is a customer-support agent (a small LangGraph graph) that handles refund tickets by calling tools: look up the order, retrieve the refund policy from a vector store, decide, and reply. Every LLM call, tool call, retry, and RAG lookup is instrumented with OpenTelemetry and shipped to a self-hosted SigNoz.
 
-**Agent Black Box** is my entry for the Agents of SigNoz hackathon (Track 01).
-It's two things working as one loop:
+The second half is an SRE copilot. When the agent misbehaves, SigNoz fires an alert to a webhook, and the copilot turns that alert plus the surrounding telemetry into a root-cause report with a suggested fix. The whole thing runs against SigNoz installed via Foundry, and the `casting.yaml` + lockfile are in the repo so the deployment reproduces.
 
-1. A **flight recorder** that traces every step of an AI agent into SigNoz —
-   LLM calls, tool calls, retries, RAG lookups, token spend, and errors.
-2. An **SRE copilot** that, when an agent misbehaves, reads that telemetry back
-   out of SigNoz and produces an *evidence-backed* root-cause report with a
-   suggested guardrail — then you fix it and **replay the same incident** to
-   prove it's gone.
+The agent task itself is deliberately boring. The point is the observability, so I gave the agent three ways to break on purpose.
 
-The demo tells one story: **before → failure → observability → diagnosis → fix
-→ after.**
+## How the agent breaks
 
-## The test subject: a support agent that breaks on purpose
+Each failure is a deterministic switch, so I can reproduce the same incident before and after a fix:
 
-The agent itself is deliberately boring — a customer-support bot built with
-LangGraph that handles refund tickets. It classifies the ticket, looks up the
-order, retrieves the refund policy from a vector store, reasons about
-eligibility, acts (issue refund / open a ticket), and replies.
+- Retry storm: the order-lookup tool returns HTTP 503 and the agent retries with no budget, burning time and tokens.
+- Bad RAG: the vector search returns the wrong policy document with a low confidence score, and a valid refund gets denied.
+- Tool loop: ambiguous retrieval keeps confidence low, so the agent re-queries the same policy in a loop.
 
-The *interesting* part is that it breaks in three realistic, reproducible ways:
-
-- **Retry storm.** The `lookup_order` tool flaps `503`. With no retry budget and
-  no fallback, the agent hammers it 11 times — latency and token cost climb for
-  nothing.
-- **Bad RAG retrieval.** The vector search returns the *wrong* policy document
-  with a low confidence score, and the agent denies a perfectly valid refund.
-- **Ambiguous-context tool loop.** Low-confidence retrieval keeps the agent
-  re-querying the same policy in a loop instead of escalating.
-
-These aren't contrived — they're exactly the failure classes the hackathon
-brief calls out about agents being a black box. Because each is a deterministic
-switch (see `scenarios.py`), I can reproduce the *same* incident on demand,
-which is what makes the before/after replay credible.
+These are the failure classes the hackathon brief calls out, and they map cleanly onto telemetry: a retry storm is a span that repeats, a bad retrieval is a low `rag.confidence` attribute, a loop is one span name appearing over and over in a trace.
 
 ## What SigNoz records
 
-The whole point is to use SigNoz as the centerpiece, not a checkbox — traces,
-metrics, logs, dashboards, **and** alerts, together.
+Each support session becomes a single trace, `support_agent.session`, with the LLM turns and tool calls nested underneath. The LLM spans follow the OpenTelemetry GenAI semantic conventions, so `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and a computed `gen_ai.usage.cost_usd` all sit on the span. A tool-loop session shows up as a tall waterfall of `tool.retrieve_policy` spans, which is exactly the shape of the bug.
 
-**Traces.** Each support session is one trace, `support_agent.session`, with a
-clean span tree: `classify → lookup_order → retrieve_policy → chat <model> →
-issue_refund → final_response`. LLM spans follow the OpenTelemetry **GenAI
-semantic conventions** — `gen_ai.system`, `gen_ai.request.model`,
-`gen_ai.usage.input_tokens` / `output_tokens`, plus a computed `cost_usd`. Tool
-spans carry `tool.name`, `tool.retry_count`, `rag.document_id`, and
-`rag.confidence`. That means a retry storm *looks like* a retry storm in the
-trace view: eleven red `lookup_order` attempts, right there.
+Metrics feed a dashboard I called the Agent Flight Deck: token cost, retries by tool, failed sessions by failure mode, tool calls, and low-confidence retrievals.
 
-**Metrics.** Custom instruments — `agent.retries`, `agent.tokens`,
-`agent.cost.usd`, `agent.rag.confidence`, `agent.sessions.failed`,
-`agent.tool.latency` — power an "Agent Flight Deck" dashboard: p95 session
-latency, token cost by session, failed sessions by failure mode, retry count by
-tool, a tool-latency heatmap, and error rate by agent version.
+![Agent Flight Deck dashboard in SigNoz](images/agent-flight-deck.png)
 
-**Logs.** Every decision is a structured log line, bridged through OTLP so it
-carries its `trace_id` — click a spike on the dashboard, land on the trace,
-read the exact log that explains it.
+Logs are bridged through the OTel logging handler, so every structured log line the agent writes carries its trace and span IDs. Clicking a spike on a trace lands on the log that explains it, without matching timestamps by hand.
 
-**Alerts.** A mix of alert types (metric thresholds, trace/exception rates,
-composite conditions) — retry storm, cost spike, tool loop, RAG risk, tool
-outage — each routed to a webhook that wakes the copilot, carrying the
-`agent_session_id` and `trace_id` as labels.
+The instrumentation setup is small. A resource, three OTLP exporters, and a logging handler:
 
-## The copilot: evidence, not vibes
-
-Here's the design decision I care most about. SigNoz already ships an MCP server
-that lets an assistant *ask questions* of your telemetry. So "a chatbot for your
-metrics" isn't the interesting product — SigNoz already does that. The
-interesting product is **incident-driven and replayable**.
-
-When an alert fires, the copilot receives the webhook, queries SigNoz for the
-relevant trace and session metrics, and writes a report like:
-
-> **Incident: Retry storm in session sess-1a2b3c4d**
-> The agent spent 142s and $1.87 in tokens because `lookup_order` failed 11
-> times. The retry loop began after `tool.lookup_order` returned HTTP 503; no
-> max-retry guardrail stopped it.
->
-> **Evidence:** trace `…`, failing span `tool.lookup_order`, `agent.retries = 11`.
-> **Likely root cause:** no retry budget and no fallback path.
-> **Suggested fixes:** add `max_retries=3` with backoff; fall back to
-> `create_support_ticket` on outage.
-> **Suggested guardrail:** alert when `agent.retries > 5` per session.
-
-The rule that keeps it honest: **every claim is grounded in telemetry the
-copilot actually pulled.** The LLM narrates the evidence; it doesn't invent
-trace IDs or numbers. And it degrades gracefully — with no live SigNoz it falls
-back to the alert labels, and with no LLM key it emits a templated but still
-evidence-backed report. Good insurance for a live demo.
-
-## Why this maps to the judging rubric
-
-- **Best Use of SigNoz** — traces + metrics + logs + dashboards + alerts operate
-  as a single closed loop, and the copilot consumes the query API / MCP server
-  as an evidence source.
-- **Technical excellence** — real OpenTelemetry GenAI conventions, custom metric
-  instruments, trace↔log correlation via the OTLP logging bridge, and an
-  in-memory-exporter test suite that verifies the instrumentation with no
-  external dependencies.
-- **Impact & creativity** — debugging agents is a genuine production pain, and
-  "flight recorder + incident replay + root-cause copilot" is more memorable
-  than another dashboard.
-- **UX & presentation** — one incident report instead of manual telemetry
-  spelunking, and the before/after replay is the whole story.
-
-## Try it
-
-```bash
-# 1. SigNoz self-hosted
-git clone -b main https://github.com/SigNoz/signoz.git
-cd signoz/deploy/docker && docker compose up -d
-
-# 2. the agent
-cd agent-black-box && pip install -r requirements.txt
-cp .env.example .env   # add OPENAI_API_KEY
-python -m src.main demo            # happy → retry_storm → bad_rag → tool_loop
-
-# 3. the copilot
-python -m copilot.webhook_server
-python scripts/send_test_alert.py retry_storm   # see the RCA at localhost:8099
+```python
+resource = Resource.create({
+    "service.name": "agent-black-box",
+    "service.version": AGENT_VERSION,
+    "service.instance.id": "agent-black-box-agent-1",  # see "what surprised me"
+})
+tracer_provider = TracerProvider(resource=resource)
+tracer_provider.add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{ENDPOINT}/v1/traces")))
 ```
 
-The most important design call: **the agent's job is trivial on purpose.** The
-observability story is where the complexity lives — because the point isn't the
-smartest support bot, it's proving that SigNoz can make an AI agent
-understandable, debuggable, and safer to operate.
+## From an alert to a root cause
 
-*Built for [Agents of SigNoz](https://www.wemakedevs.org/hackathons/signoz).*
+I built a metric alert in SigNoz on `agent.retries` grouped by `tool.name`, routed to a webhook channel pointed at the copilot. When a retry storm happens, SigNoz posts an Alertmanager-style payload to the copilot, carrying the failure mode, the tool, and the observed value in the annotation text.
+
+The copilot reads that payload, pulls the evidence, and writes a report. Here is a real one, from a real alert:
+
+```
+Incident: Retry Storm in tool lookup_order
+- Observed value: 11 (threshold 5)
+- Tool: lookup_order
+- Failing span: tool.lookup_order
+Likely root cause: lookup_order retried an upstream 503 with no
+retry budget and no fallback path.
+Suggested fixes:
+1. Add max_retries=3 with exponential backoff to lookup_order.
+2. Add a fallback: create_support_ticket when the order API is unavailable.
+```
+
+The rule I held myself to: every line in the report has to trace back to telemetry the copilot actually read. The LLM writes the prose; it does not invent the number 11 or the span name. If evidence is missing, the report says so.
+
+## The fix, then a replay
+
+The copilot suggested a retry budget with a fallback, so I shipped exactly that as v2 behavior, controlled by one config value. `RETRY_BUDGET=0` is the buggy v1 that storms. `RETRY_BUDGET=3` is the fixed v2 that gives up after three tries and opens a support ticket instead.
+
+Replaying the same scenario on v2, the `tool.lookup_order` span now records three retries instead of eleven, the session ends with `failure_mode=none`, and the retry-storm alert stops firing because the peak retry count drops below the threshold. In the trace, the loud red span becomes a short one with a graceful fallback next to it. That before-and-after, driven by the same seed and visible in the same trace view, is the story I wanted the tool to tell.
+
+## What surprised me
+
+The instrumentation was the easy part. Getting a metric alert to actually fire taught me the most, and none of it is in a quickstart.
+
+SigNoz's `rate()` and `increase()` returned zero for my retry counter, even though ClickHouse clearly showed eleven retries. Two things were wrong. First, every agent run is a short-lived process, and the OpenTelemetry SDK stamps a fresh `service.instance.id` on each one, so a single metric fractured into thirty-one separate short series. Pinning a stable instance id fixed that. Second, `increase` needs a series that rises across the window, but these counters jump to eleven and vanish in thirteen seconds, so the delta reads as zero. Switching the alert to `max` (the peak value in the window) gave me the number I wanted, and it reads naturally: the worst session had more than five retries.
+
+I also learned that a high-cardinality label like `session_id` on a metric is a trap. It makes every session its own series and breaks aggregation. Session id belongs on traces and logs, where it does the correlation work; the metrics stay low-cardinality.
+
+Two more that cost real time: SigNoz evaluates alerts on a delayed window (about two minutes behind now), so fresh data sits in a blind spot and the rule reads "query result is nil" until you widen the window. And after a Docker restart, SigNoz's replicated ClickHouse tables came up read-only, which looks exactly like "no data" in the UI until you run `SYSTEM RESTORE REPLICA` on them. Both are written up in the repo so the next person does not lose the afternoon I did.
+
+## Wrapping up
+
+The build proves a simple claim: with OpenTelemetry and SigNoz, an AI agent stops being a black box. You can watch a session as a trace, chart its cost and retries, get paged when it storms, and read a root-cause report grounded in the telemetry instead of a guess. Code, the reproducible Foundry deployment, and the full debugging notes are in the repo.
+
+- Repository: https://github.com/SamipSGz/agent-black-box
+- SigNoz install docs: https://signoz.io/docs/install/docker/
+- OpenTelemetry GenAI semantic conventions: https://opentelemetry.io/docs/specs/semconv/gen-ai/
